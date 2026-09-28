@@ -1,0 +1,34 @@
+#!/sbin/openrc-run
+# Утримання турбо під тривалим CPU-навантаженням (переармування EC).
+#
+# Використовує supervise-daemon: якщо процес помирає (спостерігалось —
+# довгоживучий bash тихо зникав без OOM/краху), OpenRC піднімає його заново.
+# Без цього доводилось помічати вручну, що "не буститься", і робити restart.
+
+name="sustained-turbo"
+description="Утримує повний турбо (переармування EC) під тривалим навантаженням"
+
+supervisor="supervise-daemon"
+command="/usr/local/bin/sustained-turbo"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+# перезапуск при падінні: чекати 5с, максимум 10 спроб за 60с
+respawn_delay=5
+respawn_max=10
+respawn_period=60
+
+output_log="/var/log/sustained-turbo.log"
+error_log="/var/log/sustained-turbo.log"
+
+depend() {
+    need localmount
+    after throttled
+}
+
+start_pre() {
+    if [ ! -w /sys/firmware/acpi/platform_profile ]; then
+        eerror "Немає доступу на запис до /sys/firmware/acpi/platform_profile"
+        return 1
+    fi
+    checkpath -f -m 0644 -o root:root /var/log/sustained-turbo.log
+}

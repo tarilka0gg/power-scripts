@@ -1,0 +1,399 @@
+#!/bin/bash
+# sustained-turbo — утримує повний турбо-режим під тривалим CPU-навантаженням.
+#
+# ЧОМУ ВОНО ПОТРІБНЕ
+# EC цього ноута дає повні PL1 (80W) лише ~2-2.5 хв, після чого знімає дозвіл
+# на турбо і CPU падає на гарантований рівень (HWP guaranteed, ratio 28 ->
+# ~2586 MHz, 45W). Це НЕ RAPL-ліміт: MSR 0x610 і MMIO 0x59A0 весь час показують
+# 80W, PROCHOT не смикається, PSYS вимкнений, до TjMax лишається 35 градусів.
+# Обійти через MSR не вийшло: CONFIG_TDP_LEVEL1 (0x649) read-only, підняття
+# HWP min (11 -> 39) платформа ігнорує.
+# Єдиний робочий важіль — РЕАЛЬНИЙ запис у /sys/firmware/acpi/platform_profile:
+# він скидає турбо-бюджет EC і одразу повертає 80W/3550MHz навіть посеред
+# навантаження. Саме це тут і робиться, раз на REARM_INTERVAL секунд.
+#
+# ЧОМУ НЕ ЗАВЖДИ
+# Постійне переармування тримає пакет на 78-80C замість 64C і крутить
+# вентилятори. Тому за замовчуванням режим AUTO: демон вмикається лише коли
+# навантаження реально тривале, і гасне у простої.
+#
+# ЧОМУ ТУТ Є СВОЯ КРИВА ВЕНТИЛЯТОРІВ (2026-08-01)
+# Кожен запис у platform_profile (тобто rearm()) під капотом дзвонить у
+# hp_wmi hp_wmi_get_fan_count_userdefine_trigger(), яка тримає EC у режимі
+# "user-defined thermal/fan state" ще 120с. Поки ми переармовуємо частіше
+# за ці 120с (а REARM_INTERVAL=90 < 120 — саме так і є), EC НІКОЛИ не
+# повертається у свій fallback-стан, від якого залежить pwm1_enable=2 (auto)
+# на платі 8C99 ("Unknown EC layout" в dmesg — upstream не має for неї
+# fallback-таблиці). Наслідок: поки цей демон активний, штатна авто-крива
+# вентиляторів НЕ працює — вентилятори мовчать навіть при 87C. Тому, раз ми
+# й так тримаємо EC в user-defined стані, беремо керування вентиляторами
+# на себе (pwm1_enable=1 + проста температурна крива) на весь час, поки
+# rearm активний, і повертаємо pwm1_enable=2 назад, щойно перестаємо
+# переармовувати (auto: при деактивації; always: ніколи, поки не зупинений).
+#
+# РЕЖИМИ
+#   auto   (типово) — стежить за завантаженням CPU; вмикає переармування, коли
+#                     воно тримається вище LOAD_THRESHOLD довше LOAD_SUSTAIN
+#                     секунд, і відпускає після LOAD_RELEASE секунд нижче порогу
+#   always          — переармовує постійно (для довгих збірок, коли точно треба)
+#   off             — нічого не робить
+set -u
+
+CONF=/etc/conf.d/sustained-turbo
+[ -f "$CONF" ] && . "$CONF"
+
+MODE="${MODE:-auto}"
+REARM_INTERVAL="${REARM_INTERVAL:-90}"
+LOAD_THRESHOLD="${LOAD_THRESHOLD:-70}"   # % завантаження всіх ядер
+LOAD_SUSTAIN="${LOAD_SUSTAIN:-60}"       # с вище порогу перед активацією
+LOAD_RELEASE="${LOAD_RELEASE:-45}"       # с нижче порогу перед деактивацією
+POLL="${POLL:-10}"                       # період семплювання, с
+LOAD_W="${LOAD_W:-0.4}"
+PWM_FLOOR="${PWM_FLOOR:-90}"
+FIXED_PWM="${FIXED_PWM:-90}"          # лише для MODE=fixed: постійне значення pwm1 (0-255)
+FIXED_POLL="${FIXED_POLL:-1}"          # лише для MODE=fixed: інтервал корекції, с (EC тягне вниз між корекціями — частіше=менше видимих провалів)
+PWM_CEIL="${PWM_CEIL:-210}"
+CURVE_POINTS="${CURVE_POINTS:-60:90 70:110 80:150 88:190 92:225 95:252}"
+# --- сумарна ватність (RAPL package + GPU) як ПОВНОЦІННА крива, не просто
+# добавка: на відміну від temp/load (де сигнал лише додає зверху і ніколи
+# не послаблює), ватність повинна вміти й ОПУСКАТИ оберти при малому
+# споживанні. Тому фінальний pwm = max(temp+load крива, power-крива) —
+# power-крива або тягне вгору незалежно від того, чи встигла піднятись
+# temp (feedforward), або опускається до свого floor, коли споживання мале.
+# POWER_CURVE_POINTS: "ватт:pwm", кусково-лінійна, той самий принцип що
+# CURVE_POINTS. 40W -> pwm60 (=1200 RPM, заміряно) — задана точка.
+POWER_CURVE_POINTS="${POWER_CURVE_POINTS:-25:45 40:60 70:130 110:200 140:255}"
+# Гістерезис проти смикання: якщо було >=HIGH_POWER_W протягом останніх
+# HIGH_POWER_HOLD_S секунд — тримаємо power-компонент на останньому
+# "високому" значенні і НЕ опускаємо його, навіть якщо споживання щойно
+# впало. Опускаємо лише після HIGH_POWER_HOLD_S спокою.
+HIGH_POWER_W="${HIGH_POWER_W:-70}"
+HIGH_POWER_HOLD_S="${HIGH_POWER_HOLD_S:-900}"
+PROFILE_PATH=/sys/firmware/acpi/platform_profile
+LOG="${LOG:-/var/log/sustained-turbo.log}"
+
+log(){ echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+# --- завантаження CPU у % за інтервал, з /proc/stat ---
+# ВАЖЛИВО: пише результат у глобальну CPU_PCT, а не echo. Виклик через
+# $(cpu_usage) форкав би підпроцес — prev_idle/prev_total оновлювались би
+# лише в ньому і губились би після повернення, тому усереднення йшло б
+# не за останні POLL секунд, а за весь час від старту демона (саме так
+# і було: 15-19% практично незмінні — це середнє з моменту запуску).
+prev_idle=0; prev_total=0; CPU_PCT=0
+cpu_usage(){
+    local line idle total diff_idle diff_total
+    line=$(head -1 /proc/stat)
+    set -- $line
+    shift                      # прибрати "cpu"
+    idle=$4                    # idle
+    total=0
+    for v in "$@"; do total=$((total + v)); done
+    diff_idle=$((idle - prev_idle))
+    diff_total=$((total - prev_total))
+    prev_idle=$idle; prev_total=$total
+    if [ "$diff_total" -le 0 ]; then CPU_PCT=0; return; fi
+    CPU_PCT=$(( (100 * (diff_total - diff_idle)) / diff_total ))
+}
+
+rearm(){
+    if echo performance > "$PROFILE_PATH" 2>/dev/null; then
+        return 0
+    fi
+    log "УВАГА: не вдалось записати в $PROFILE_PATH"
+    return 1
+}
+
+# --- сумарна ватність: CPU package (RAPL, дельта energy_uj/час) + GPU (nvidia-smi) ---
+find_rapl_pkg(){
+    local z
+    for z in /sys/class/powercap/intel-rapl:*; do
+        [ "$(cat "$z/name" 2>/dev/null)" = "package-0" ] && { echo "$z"; return 0; }
+    done
+    return 1
+}
+RAPL_PATH=$(find_rapl_pkg || true)
+RAPL_MAX_UJ=$([ -n "$RAPL_PATH" ] && cat "$RAPL_PATH/max_energy_range_uj" 2>/dev/null || echo 0)
+[ -z "$RAPL_PATH" ] && log "УВАГА: RAPL package-0 не знайдено — ватність рахуватиме лише GPU"
+HAVE_NVIDIA_SMI=0
+command -v nvidia-smi >/dev/null 2>&1 && HAVE_NVIDIA_SMI=1
+
+# ВАЖЛИВО (той самий момент, що й з cpu_usage): пише в глобальну POWER_NOW,
+# а НЕ echo — інакше $(read_power_w) форкав би підпроцес і prev_energy_uj/
+# prev_energy_time губились би після кожного виклику, і дельта RAPL завжди
+# рахувалась би з нуля (cpu_w завжди 0).
+prev_energy_uj=""; prev_energy_time=0; POWER_NOW=0
+read_power_w(){
+    local e2 t2 de dt cpu_w gpu_w
+    cpu_w=0
+    if [ -n "$RAPL_PATH" ]; then
+        e2=$(cat "$RAPL_PATH/energy_uj" 2>/dev/null) || e2=""
+        t2=$(date +%s%N)
+        if [ -n "$e2" ] && [ -n "$prev_energy_uj" ] && [ "$prev_energy_time" -gt 0 ]; then
+            de=$((e2 - prev_energy_uj))
+            [ "$de" -lt 0 ] && [ "$RAPL_MAX_UJ" -gt 0 ] && de=$((de + RAPL_MAX_UJ))
+            dt=$((t2 - prev_energy_time))
+            [ "$dt" -gt 0 ] && cpu_w=$(awk -v de="$de" -v dt="$dt" 'BEGIN{printf "%.1f", de*1000/dt}')
+        fi
+        prev_energy_uj=$e2
+        prev_energy_time=$t2
+    fi
+    gpu_w=0
+    # На батареї dGPU не опитуємо: кожен nvidia-smi скидає таймер RTD3, і вона
+    # ніколи не доходить до D3cold. Уві сні вона однаково ~0 Вт.
+    # /run/deep-idle ставить ~/idle-on.sh — там dGPU теж має спати.
+    if [ "$HAVE_NVIDIA_SMI" -eq 1 ] && [ "$(cat /sys/class/power_supply/ACAD/online 2>/dev/null)" = "1" ] \
+       && [ ! -e /run/deep-idle ] \
+       && [ "$(cat /sys/bus/pci/devices/0000:01:00.0/power/runtime_status 2>/dev/null)" = "active" ]; then
+        gpu_w=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)
+        case "$gpu_w" in ''|*[!0-9.]*) gpu_w=0 ;; esac
+    fi
+    POWER_NOW=$(awk -v c="$cpu_w" -v g="$gpu_w" 'BEGIN{printf "%.1f", c+g}')
+}
+
+# --- власне керування вентиляторами (див. коментар вище) ---
+find_fan_hwmon(){
+    local h
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$h/name" 2>/dev/null)" = "hp" ] && { echo "$h"; return 0; }
+    done
+    return 1
+}
+find_cpu_temp(){
+    local h l
+    for h in /sys/class/hwmon/hwmon*; do
+        [ "$(cat "$h/name" 2>/dev/null)" = "coretemp" ] || continue
+        for l in "$h"/temp*_label; do
+            [ -f "$l" ] || continue
+            grep -qi 'Package' "$l" 2>/dev/null && { echo "${l%_label}_input"; return 0; }
+        done
+    done
+    return 1
+}
+FAN_HWMON=$(find_fan_hwmon || true)
+CPU_TEMP_PATH=$(find_cpu_temp || true)
+[ -z "$FAN_HWMON" ] && log "УВАГА: hp fan hwmon не знайдено — крива вентиляторів вимкнена"
+[ -z "$CPU_TEMP_PATH" ] && log "УВАГА: coretemp Package не знайдено — крива вентиляторів вимкнена"
+
+fan_take_control(){
+    [ -n "$FAN_HWMON" ] || return 1
+    echo 1 > "$FAN_HWMON/pwm1_enable" 2>/dev/null
+    log "fan control: manual ($FAN_HWMON)"
+}
+fan_release_control(){
+    [ -n "$FAN_HWMON" ] || return 1
+    echo 2 > "$FAN_HWMON/pwm1_enable" 2>/dev/null
+    log "fan control: повернуто EC (pwm1_enable=2)"
+}
+
+# Кусково-лінійна інтерполяція "x:y x:y ..." -> y при заданому x (clamp
+# на кінцях). Спільна для CURVE_POINTS (temp) і POWER_CURVE_POINTS (watts).
+# Без стану — безпечно викликати через $(...).
+curve_interp(){
+    local pts=$1 x=$2
+    awk -v x="$x" -v pts="$pts" '
+    BEGIN {
+        n = split(pts, arr, " ")
+        for (i = 1; i <= n; i++) { split(arr[i], kv, ":"); cx[i]=kv[1]; cy[i]=kv[2] }
+        if (x <= cx[1]) { y = cy[1] }
+        else if (x >= cx[n]) { y = cy[n] }
+        else {
+            for (i = 1; i < n; i++) {
+                if (x >= cx[i] && x <= cx[i+1]) {
+                    frac = (x - cx[i]) / (cx[i+1] - cx[i])
+                    y = cy[i] + frac * (cy[i+1] - cy[i])
+                    break
+                }
+            }
+        }
+        printf "%d", y + 0.5
+    }'
+}
+
+# temp -> pwm (CURVE_POINTS) + адитивне прискорення від load. temp сама
+# завжди здатна дотягнутись до стелі, load лише додає зверху.
+fan_curve_temp_load(){
+    local t=$1 u=$2 base
+    base=$(curve_interp "$CURVE_POINTS" "$t")
+    awk -v base="$base" -v u="$u" -v lw="$LOAD_W" -v pc="$PWM_CEIL" -v pf="$PWM_FLOOR" '
+    BEGIN {
+        ln = u / 100; if (ln < 0) ln = 0; if (ln > 1) ln = 1
+        pwm = base + lw * ln * (pc - base)
+        if (pwm > pc) pwm = pc
+        if (pwm < pf) pwm = pf
+        printf "%d", pwm + 0.5
+    }'
+}
+
+# power -> pwm (POWER_CURVE_POINTS) із гістерезисом: див. коментар біля
+# HIGH_POWER_W/HIGH_POWER_HOLD_S вище. 2026-09-19: замість плато+обрив —
+# (1) якщо temp вже нормалізувалась (<=TEMP_FLOOR_C, той самий поріг, що й
+# перша точка CURVE_POINTS) — відпускаємо ОДРАЗУ, не чекаючи HIGH_POWER_HOLD_S;
+# (2) інакше — лінійний спад від зафіксованого піку (held_power_pwm) до
+# поточного curve_val за HIGH_POWER_HOLD_S секунд, а не миттєвий стрибок
+# після завершення утримання.
+# ВАЖЛИВО: пише в глобальну POWER_COMPONENT, а НЕ echo (той самий урок,
+# що з cpu_usage/read_power_w — стан мусить пережити виклик).
+last_high_power_time=0
+held_power_pwm=45
+POWER_COMPONENT=45
+update_power_component(){
+    local power=$1 temp=$2 now curve_val is_high temp_ok elapsed
+    now=$(date +%s)
+    curve_val=$(curve_interp "$POWER_CURVE_POINTS" "$power")
+    is_high=$(awk -v p="$power" -v h="$HIGH_POWER_W" 'BEGIN{print (p>=h)?1:0}')
+    if [ "$is_high" -eq 1 ]; then
+        last_high_power_time=$now
+        held_power_pwm=$curve_val
+        POWER_COMPONENT=$curve_val
+        return
+    fi
+    temp_ok=$(awk -v t="$temp" -v tf="$TEMP_FLOOR_C" 'BEGIN{print (t<=tf)?1:0}')
+    if [ "$temp_ok" -eq 1 ] || [ "$last_high_power_time" -eq 0 ]; then
+        held_power_pwm=$curve_val
+        POWER_COMPONENT=$curve_val
+        return
+    fi
+    elapsed=$((now - last_high_power_time))
+    if [ "$elapsed" -ge "$HIGH_POWER_HOLD_S" ]; then
+        held_power_pwm=$curve_val
+        POWER_COMPONENT=$curve_val
+    else
+        POWER_COMPONENT=$(awk -v held="$held_power_pwm" -v cv="$curve_val" -v e="$elapsed" -v h="$HIGH_POWER_HOLD_S" \
+            'BEGIN{frac=e/h; v=held-frac*(held-cv); printf "%d", v+0.5}')
+    fi
+}
+
+last_pwm=-1
+fan_apply_curve(){
+    # $1 = поточний CPU load % (рахує викликач — щоб не смикати cpu_usage()
+    # двічі за один POLL-інтервал і не псувати prev_idle/prev_total)
+    [ -n "$FAN_HWMON" ] && [ -n "$CPU_TEMP_PATH" ] || return 1
+    local traw t u="$1" w pwm_tl held pwm
+    traw=$(cat "$CPU_TEMP_PATH" 2>/dev/null) || return 1
+    t=$(( traw / 1000 ))
+    read_power_w
+    w="$POWER_NOW"
+    update_power_component "$w" "$t"
+    pwm_tl=$(fan_curve_temp_load "$t" "$u")
+    held=$POWER_COMPONENT
+    pwm=$(awk -v a="$pwm_tl" -v b="$held" -v pf="$PWM_FLOOR" -v pc="$PWM_CEIL" '
+        BEGIN { m = (a>b)?a:b; if (m>pc) m=pc; if (m<pf) m=pf; printf "%d", m }')
+    if [ "$pwm" != "$last_pwm" ]; then
+        echo "$pwm" > "$FAN_HWMON/pwm1" 2>/dev/null
+        log "крива: CPU=${t}C load=${u}% power=${w}W temp/load->${pwm_tl} power->${held} => pwm1=${pwm}"
+        last_pwm=$pwm
+    fi
+}
+
+case "$MODE" in
+  off)
+      log "режим off — виходжу"
+      exit 0
+      ;;
+  always)
+      log "режим always — переармування кожні ${REARM_INTERVAL}с + власна крива вентиляторів (temp+load feedforward)"
+      trap 'fan_release_control; exit 0' TERM INT
+      fan_take_control
+      cpu_usage                     # ініціалізація лічильників (перший виклик інакше сміття)
+      sleep 1 & wait $!
+      cpu_usage; fan_apply_curve "$CPU_PCT"  # застосувати криву одразу, не чекаючи перших 15с циклу
+      since_rearm=$REARM_INTERVAL
+      while true; do
+          sleep 15 & wait $!
+          cpu_usage; fan_apply_curve "$CPU_PCT"
+          since_rearm=$((since_rearm + 15))
+          if [ "$since_rearm" -ge "$REARM_INTERVAL" ]; then
+              rearm && since_rearm=0
+          fi
+      done
+      ;;
+  auto)
+      # ВАЖЛИВО: крива вентиляторів тут АКТИВНА ЗАВЖДИ (fan_take_control раз
+      # на старті, fan_release_control лише при зупинці демона), незалежно
+      # від того, форсуємо ми зараз turbo чи ні. Причина — EC цієї плати
+      # (8C99, "Unknown EC layout") не має fallback-таблиці: у pwm1_enable=2
+      # вентилятори МОВЧАТЬ навіть при 87C (див. коментар на початку файлу).
+      # Тому "відпускати" fan-контроль в холостому режимі небезпечно —
+      # натомість тиша в простої забезпечується самою кривою (temp+load+
+      # power усі природньо опускаються до PWM_FLOOR, коли справді нічого
+      # не рахується). Форсування platform_profile=performance (rearm) —
+      # єдине, що лишається умовним, за тією ж гістерезисою load.
+      log "режим auto: forceTurbo поріг=${LOAD_THRESHOLD}% тримати=${LOAD_SUSTAIN}с відпускати=${LOAD_RELEASE}с; крива вентиляторів активна завжди"
+      cpu_usage                     # ініціалізація лічильників
+      active=0; above=0; below=0; since_rearm=0
+      trap 'fan_release_control; exit 0' TERM INT
+      fan_take_control
+      fan_apply_curve "$CPU_PCT"
+      while true; do
+          sleep "$POLL" & wait $!
+          cpu_usage; u=$CPU_PCT
+          if [ "$u" -ge "$LOAD_THRESHOLD" ]; then
+              above=$((above + POLL)); below=0
+          else
+              below=$((below + POLL)); above=0
+          fi
+
+          if [ "$active" -eq 0 ] && [ "$above" -ge "$LOAD_SUSTAIN" ]; then
+              active=1; since_rearm=$REARM_INTERVAL
+              log "АКТИВАЦІЯ turbo: навантаження ${u}% тримається ${above}с"
+          elif [ "$active" -eq 1 ] && [ "$below" -ge "$LOAD_RELEASE" ]; then
+              active=0
+              log "ВІДПУСКАЮ turbo: навантаження ${u}% нижче порогу ${below}с (крива вентиляторів лишається активною)"
+          fi
+
+          fan_apply_curve "$u"
+
+          if [ "$active" -eq 1 ]; then
+              since_rearm=$((since_rearm + POLL))
+              if [ "$since_rearm" -ge "$REARM_INTERVAL" ]; then
+                  rearm && since_rearm=0
+              fi
+          fi
+      done
+      ;;
+  fixed)
+      # Постійні НЕЗМІННІ оберти: temp/power/load повністю ігноруються,
+      # platform_profile не форсується (жодного зв'язку з turbo-логікою
+      # вище). Просто тримає pwm1=$FIXED_PWM, перевіряючи й відновлюючи
+      # значення раз на POLL секунд (на випадок якщо EC чи щось інше його
+      # перепише). Для реального захисту від перегріву не призначений —
+      # обирайте FIXED_PWM з запасом.
+      [ -n "$FAN_HWMON" ] || { log "режим fixed: hp fan hwmon не знайдено, виходжу"; exit 1; }
+      # rearm() тут ТЕЖ потрібен, попри назву режиму "fixed": без нього EC
+      # не тримається у user-defined thermal state (той самий механізм, що
+      # й у auto/always — див. коментар на початку файлу) і постійно
+      # відвойовує pwm1 назад до власного значення. Це причина, а не
+      # частота корекції: без rearm жодна частота polling не дасть стабільних
+      # обертів, бо EC пише в той самий регістр незалежно від нас.
+      log "режим fixed — pwm1=${FIXED_PWM} постійно, rearm кожні ${REARM_INTERVAL}с для утримання EC (temp/power НЕ впливають на pwm)"
+      trap 'fan_release_control; exit 0' TERM INT
+      fan_take_control
+      rearm
+      echo "$FIXED_PWM" > "$FAN_HWMON/pwm1" 2>/dev/null
+      log "pwm1 встановлено на ${FIXED_PWM}"
+      drift_logged=0
+      since_rearm=0
+      while true; do
+          sleep "$FIXED_POLL" & wait $!
+          cur=$(cat "$FAN_HWMON/pwm1" 2>/dev/null)
+          if [ "$cur" != "$FIXED_PWM" ]; then
+              echo "$FIXED_PWM" > "$FAN_HWMON/pwm1" 2>/dev/null
+              if [ "$drift_logged" -eq 0 ]; then
+                  log "pwm1 відхилився на ${cur}, повернуто на ${FIXED_PWM} (коригую кожні ${FIXED_POLL}с, подальші відхилення не логую)"
+                  drift_logged=1
+              fi
+          else
+              drift_logged=0
+          fi
+          since_rearm=$((since_rearm + FIXED_POLL))
+          if [ "$since_rearm" -ge "$REARM_INTERVAL" ]; then
+              rearm && since_rearm=0
+          fi
+      done
+      ;;
+  *)
+      log "невідомий MODE='$MODE' (очікую auto|always|fixed|off)"
+      exit 1
+      ;;
+esac

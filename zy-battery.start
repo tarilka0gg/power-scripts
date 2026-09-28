@@ -1,0 +1,10 @@
+#!/bin/sh
+# udev only fires on AC *changes*, so apply the matching mode once at boot.
+# Runs after performance.start (lexical order), which would otherwise leave
+# performance/EPP/C3-off even when booted on battery. Session parts (niri,
+# noctalia IPC) no-op here; niri's spawn-sh-at-startup handles sunshine/60Hz.
+if [ "$(cat /sys/class/power_supply/ACAD/online 2>/dev/null)" = "0" ]; then
+    /usr/local/bin/battery-powersave-on.sh >/dev/null 2>&1
+else
+    /usr/local/bin/battery-powersave-off.sh >/dev/null 2>&1
+fi

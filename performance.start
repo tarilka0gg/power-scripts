@@ -1,0 +1,55 @@
+#!/bin/sh
+# Переармування EC після завантаження.
+#
+# Чому не лише powerprofilesctl: якщо профіль УЖЕ performance, виклик є no-op,
+# запису в /sys/firmware/acpi/platform_profile не відбувається, і EC лишається
+# із заниженим власним лімітом. Наслідок — PL1/PL2 з throttled не діють:
+# заміряно 52 W замість 80 W під повним навантаженням.
+# Прямий запис у sysfs проходить завжди і змушує прошивку перезастосувати ліміти.
+#
+# Після цього throttled протягом Update_Rate_s (5 с) повертає свої PL1/PL2.
+
+powerprofilesctl set performance 2>/dev/null   # тримає стан PPD узгодженим
+echo performance > /sys/firmware/acpi/platform_profile
+
+# EPP: 'balance_performance' (дефолт intel_pstate) дає стриманіший/повільніший
+# буст, ніж 'performance'. Виставляємо на всіх ядрах.
+for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+    echo performance > "$f" 2>/dev/null
+done
+
+# Вимикаємо C3 (найглибший ACPI C-стан, латентність виходу ~1048us) —
+# дає мікрозатримки/фриз вводу в іграх при пробудженні ядра з глибокого сну.
+# C1/C2 лишаємо — мінімальний вплив на idle-споживання.
+for f in /sys/devices/system/cpu/cpu*/cpuidle/state3/disable; do
+    echo 1 > "$f" 2>/dev/null
+done
+
+# THP тільки за madvise(), не всім підряд — для анонімної пам'яті.
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+
+# Shmem-буфери (Wayland-вікна: кожне alloc'ає memfd під кадр) керуються
+# ОКРЕМИМ перемикачем shmem_enabled, не /transparent_hugepage/enabled.
+# Дефолт ядра тут — 'within_size' (CONFIG_..._SHMEM_HUGE_WITHIN_SIZE=y),
+# який роздає 2MiB huge page будь-якому досить великому сегменту без
+# madvise() — саме звідси ShmemHugePages ~1.5GiB. 'advise' вимагає явного
+# madvise(MADV_HUGEPAGE) від застосунку, як Wayland-клієнти й не роблять.
+echo advise > /sys/kernel/mm/transparent_hugepage/shmem_enabled 2>/dev/null
+
+# Zram-swap: страховка на випадок, якщо штатний OpenRC zram-init впіймав
+# "Device or resource busy" на zramctl --reset — race з udev на щойно
+# створеному блок-пристрої під час паралельного буту (rc_parallel="YES").
+# local запускається останнім (after *), тому до цього моменту race вже
+# вляглася. Ідемпотентно: якщо zram-init сам впорався, тут нічого не робимо.
+if ! swapon --show=NAME --noheadings 2>/dev/null | grep -q zram0; then
+    modprobe zram num_devices=1 2>/dev/null
+    zramctl --find --size 16G --algorithm zstd >/dev/null 2>&1
+    mkswap /dev/zram0 >/dev/null 2>&1
+    swapon -p 16383 /dev/zram0 2>/dev/null
+fi
+
+# Turbo ratio limits (MSR 0x1AD, 1 byte per active-core group): all groups 5.2 GHz
+# (stock 4.8 for 3+ cores). The i7-14650HX multiplier is locked, so fused per-core
+# caps still apply: cores 8-11 5.2 GHz, other P-cores 5.0 GHz. Not persistent in HW — resume
+# reapplies it too (/usr/lib/elogind/system-sleep/90-power-limits-rearm).
+wrmsr -a 0x1AD 0x3434343434343434 2>/dev/null

@@ -1,0 +1,2 @@
+ACTION=="change", SUBSYSTEM=="power_supply", KERNEL=="ACAD", ATTR{online}=="0", RUN+="/usr/local/bin/battery-powersave-on.sh"
+ACTION=="change", SUBSYSTEM=="power_supply", KERNEL=="ACAD", ATTR{online}=="1", RUN+="/usr/local/bin/battery-powersave-off.sh"
